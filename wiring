@@ -1,0 +1,19 @@
+Display wiring for ESP32 Audio Kit V2.2
+
+Display pin   -> ESP32 Audio Kit pin
+-----------------------------------
+VCC           -> 3V3
+GND           -> GND
+DIN (MOSI)    -> GPIO23
+CLK (SCLK)    -> GPIO18
+CS            -> GPIO5
+DC            -> GPIO19
+RST           -> RST
+BL            -> GPIO22
+
+Notes:
+- Use the ESP32 3.3V rail for VCC. Do not connect VCC to 5V.
+- Make sure GND is shared between the display and the ESP32 board.
+- RST is connected to the module reset pin so the display can reset with the ESP32.
+- BL is the display backlight enable pin and should be powered/enabled for a visible image.
+- This wiring matches the pin definitions used in `src/esp32_main.cpp` and `include/User_Setup.h`.
