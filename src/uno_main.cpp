@@ -4,172 +4,182 @@
 #include <DS3231.h>
 #include <SoftwareSerial.h>
 
-// ── RTC ────────────────────────────────────────────────────────────────────
+// I2C RTC
 DS3231 rtc;
+
+// I2C address for DS3231
 const uint8_t RTC_ADDR = 0x68;
 bool rtc_ok = false;
 
-// ── SoftwareSerial for ESP32 ───────────────────────────────────────────────
-// Reduced to 9600 — SoftwareSerial is unreliable above ~38400 on Uno.
-// Match UNO_BAUD on ESP32 side to 9600 if using this.
-// Pins 6/7 chosen to avoid conflict if steppers 2/3 are ever re-enabled
-// (they would use pins 6-13). Use 8/9 if you need 6/7 for something else.
-// *** UPDATE ESP32 UNO_BAUD to match ***
-#define ESP_RX_PIN 10   // Uno RX ← ESP32 TX (GPIO1)
-#define ESP_TX_PIN 11   // Uno TX → ESP32 RX (GPIO3)
-#define ESP_BAUD   9600
-SoftwareSerial espSerial(ESP_RX_PIN, ESP_TX_PIN);
+// Software Serial for ESP32 communication (RX on pin 10, TX on pin 11)
+// UNO RX (pin 10) receives from ESP32 TX (GPIO1)
+// UNO TX (pin 11) sends to ESP32 RX (GPIO3)
+SoftwareSerial espSerial(10, 11);  // RX=10, TX=11
 
-// ── Stepper ────────────────────────────────────────────────────────────────
-#define STEPS 2048
-Stepper stepper1(STEPS, 2, 3, 4, 5);
-int  stepper1_speed    = 6;
+#define STEPS 2048  // Steps per revolution for 28BYJ-48
+
+// Stepper pin definitions (ULN2003 driver)
+Stepper stepper1(STEPS, 2, 3, 4, 5);      // Motor 1: D2-D5
+// Stepper stepper2(STEPS, 6, 7, 8, 9);      // Motor 2: D6-D9
+// Stepper stepper3(STEPS, 10, 11, 12, 13);  // Motor 3: D10-D13
+
+// Stepper speed settings (RPM)
+int stepper1_speed = 6;
+// int stepper2_speed = 6;
+// int stepper3_speed = 6;
+
+// Current positions (steps from start)
 long stepper1_position = 0;
+// long stepper2_position = 0;
+// long stepper3_position = 0;
 
-// ── Stepper non-blocking state ─────────────────────────────────────────────
-// stepper.step() blocks for seconds. We break it into small chunks
-// so serial and RTC updates keep running during a flip.
-volatile long  stepper1_stepsRemaining = 0;
-const int      STEPS_PER_CHUNK        = 16;  // steps per loop iteration
-
-// ── Timing ────────────────────────────────────────────────────────────────
 unsigned long lastRtcUpdate = 0;
-const unsigned long RTC_UPDATE_INTERVAL = 5000;
+const unsigned long RTC_UPDATE_INTERVAL = 5000;  // Send time every 5 seconds
 bool espConnected = false;
 
-// ── Non-blocking serial buffer ────────────────────────────────────────────
-String espSerialBuffer = "";
-
-// ── Forward declarations ───────────────────────────────────────────────────
-void handleCommand(const String &cmd);
+// Forward declarations
+void handleCommand(String cmd);
 void sendTimeToESP32();
-bool rtcClockHalted();
-bool clearRtcCH();
 
-// ── Setup ──────────────────────────────────────────────────────────────────
 void setup() {
-  Serial.begin(ESP_BAUD);
+  Serial.begin(115200);
   delay(1000);
   Serial.println("\n=== Flip Clock Uno Starting ===");
+  
+  // Initialize Software Serial for ESP32 communication
+  espSerial.begin(9600);
+  Serial.println("SoftwareSerial initialized (ESP32 comm: RX=pin10, TX=pin11)");
 
-  // SoftwareSerial for ESP32
-  espSerial.begin(ESP_BAUD);
-  Serial.print("SoftwareSerial: RX=pin%d TX=pin%d @ %d baud\n");
-  Serial.println(ESP_RX_PIN);
-  Serial.println(ESP_TX_PIN);
-  Serial.println(ESP_BAUD);
-
-  // RTC — correct order: beginTransmission first, then check result
+  // Initialize I2C for RTC
   Wire.begin();
+  rtc_ok = Wire.endTransmission() == 0;  // quick bus sanity after beginTransmission below
   Wire.beginTransmission(RTC_ADDR);
   rtc_ok = (Wire.endTransmission() == 0);
   if (rtc_ok) {
     rtc.setClockMode(false);  // 24-hour mode
-    // Clear oscillator stop flag if set
-    if (rtcClockHalted()) {
-      Serial.println("RTC: CH flag set, clearing...");
-      clearRtcCH() ? Serial.println("RTC: CH cleared") 
-                   : Serial.println("RTC: CH clear FAILED");
-    }
-    Serial.println("RTC OK (I2C A4/A5)");
+    Serial.println("RTC initialized (I2C A4/A5)");
   } else {
-    Serial.println("RTC NOT FOUND at 0x68");
+    Serial.println("RTC NOT FOUND at 0x68 (check SDA=A4, SCL=A5, VCC, GND)");
   }
 
-  // Stepper
+  // Initialize steppers
   stepper1.setSpeed(stepper1_speed);
-  Serial.println("Stepper1 ready (D2-D5, 2048 steps/rev, 6 RPM)");
-  Serial.println("Setup complete\n");
+  // stepper2.setSpeed(stepper2_speed);
+  // stepper3.setSpeed(stepper3_speed);
+  Serial.println("Stepper1 initialized (D2-D5, ULN2003, 2048 steps/rev, 6 RPM)");
+  // Serial.println("Stepper2 initialized (D6-D9, ULN2003, 2048 steps/rev, 6 RPM)");
+  // Serial.println("Stepper3 initialized (D10-D13, ULN2003, 2048 steps/rev, 6 RPM)");
+
+  Serial.println("Setup complete - waiting for ESP32 commands\n");
 }
 
-// ── Loop ───────────────────────────────────────────────────────────────────
 void loop() {
-
-  // ── Non-blocking stepper — run a small chunk each loop ────────────────
-  if (stepper1_stepsRemaining != 0) {
-    int chunk = STEPS_PER_CHUNK;
-    if (stepper1_stepsRemaining < 0) chunk = -STEPS_PER_CHUNK;
-    if (abs(stepper1_stepsRemaining) < STEPS_PER_CHUNK)
-      chunk = (int)stepper1_stepsRemaining;
-
-    stepper1.step(chunk);
-    stepper1_position      += chunk;
-    stepper1_stepsRemaining -= chunk;
-  }
-
-  // ── Non-blocking ESP32 serial read ────────────────────────────────────
-  while (espSerial.available()) {
-    char c = espSerial.read();
-    if (c == '\r') continue;
-    if (c == '\n') {
-      espSerialBuffer.trim();
-      if (espSerialBuffer.length() > 0) {
-        String cmd = espSerialBuffer;
-        espSerialBuffer = "";
-
-        if (cmd == "READY") {
-          espConnected = true;
-          Serial.println("ESP32 connected (READY received)");
-          sendTimeToESP32();
-        } else {
-          handleCommand(cmd);
-        }
-      }
-    } else {
-      espSerialBuffer += c;
-      if (espSerialBuffer.length() > 128)
-        espSerialBuffer.remove(0, espSerialBuffer.length() - 128);
+  // Check for commands from ESP32 via SoftwareSerial
+  if (espSerial.available()) {
+    String cmd = espSerial.readStringUntil('\n');
+    cmd.trim();
+    if (cmd == "READY") {
+      espConnected = true;
+      Serial.println("UNO: READY received from ESP32");
+      sendTimeToESP32();  // send immediately on connect
+      return;
     }
+    handleCommand(cmd);
   }
 
-  // ── Periodic time send ─────────────────────────────────────────────────
+  // Send RTC time periodically to ESP32
   if (millis() - lastRtcUpdate >= RTC_UPDATE_INTERVAL) {
     lastRtcUpdate = millis();
-    if (espConnected) sendTimeToESP32();
+    sendTimeToESP32();
   }
 }
 
-// ── Command handler ────────────────────────────────────────────────────────
-void handleCommand(const String &cmd) {
-  Serial.println("CMD: " + cmd);
-
+void handleCommand(String cmd) {
   if (cmd == "FLIP1") {
-    // Queue steps — non-blocking, executed in loop chunks
-    stepper1_stepsRemaining = STEPS;
-    Serial.println("FLIP1 queued");
-
-  } else if (cmd == "FLIP") {
-    stepper1_stepsRemaining = STEPS;
-    Serial.println("FLIP all queued (stepper1)");
-
+    Serial.println("FLIP1 command received - rotating stepper 1");
+    stepper1.step(STEPS);  // Full rotation
+    stepper1_position += STEPS;
+    Serial.println("Flip 1 complete");
+  } /*else if (cmd == "FLIP2") {
+    Serial.println("FLIP2 command received - rotating stepper 2");
+    stepper2.step(STEPS);  // Full rotation
+    stepper2_position += STEPS;
+    Serial.println("Flip 2 complete");
+  } else if (cmd == "FLIP3") {
+    Serial.println("FLIP3 command received - rotating stepper 3");
+    stepper3.step(STEPS);  // Full rotation
+    stepper3_position += STEPS;
+    Serial.println("Flip 3 complete");
+  }*/ else if (cmd == "FLIP") {
+    // Flip all (just stepper1 for now)
+    Serial.println("FLIP all command received - rotating stepper 1");
+    stepper1.step(STEPS);
+    // stepper2.step(STEPS);
+    // stepper3.step(STEPS);
+    stepper1_position += STEPS;
+    // stepper2_position += STEPS;
+    // stepper3_position += STEPS;
+    Serial.println("Flip all complete");
   } else if (cmd.startsWith("SPEED1:")) {
-    stepper1_speed = constrain(cmd.substring(7).toInt(), 1, 15);
+    stepper1_speed = cmd.substring(7).toInt();
+    if (stepper1_speed < 1) stepper1_speed = 1;
+    if (stepper1_speed > 15) stepper1_speed = 15;
     stepper1.setSpeed(stepper1_speed);
-    Serial.println("Speed1: " + String(stepper1_speed));
-
-  } else if (cmd.startsWith("MOVE1:")) {
+    Serial.print("Stepper 1 speed set to ");
+    Serial.println(stepper1_speed);
+  } /*else if (cmd.startsWith("SPEED2:")) {
+    stepper2_speed = cmd.substring(7).toInt();
+    if (stepper2_speed < 1) stepper2_speed = 1;
+    if (stepper2_speed > 15) stepper2_speed = 15;
+    stepper2.setSpeed(stepper2_speed);
+    Serial.print("Stepper 2 speed set to ");
+    Serial.println(stepper2_speed);
+  } else if (cmd.startsWith("SPEED3:")) {
+    stepper3_speed = cmd.substring(7).toInt();
+    if (stepper3_speed < 1) stepper3_speed = 1;
+    if (stepper3_speed > 15) stepper3_speed = 15;
+    stepper3.setSpeed(stepper3_speed);
+    Serial.print("Stepper 3 speed set to ");
+    Serial.println(stepper3_speed);
+  }*/ else if (cmd.startsWith("MOVE1:")) {
     int steps = cmd.substring(6).toInt();
-    stepper1_stepsRemaining = steps;  // queued, non-blocking
-    Serial.println("MOVE1 queued: " + String(steps) + " steps");
-
-  } else if (cmd.startsWith("BL:")) {
-    Serial.println("BL: " + cmd.substring(3));  // future use
-
+    Serial.print("Moving stepper 1 by ");
+    Serial.print(steps);
+    Serial.println(" steps");
+    stepper1.step(steps);
+    stepper1_position += steps;
+    Serial.println("Move 1 complete");
+  } /*else if (cmd.startsWith("MOVE2:")) {
+    int steps = cmd.substring(6).toInt();
+    Serial.print("Moving stepper 2 by ");
+    Serial.print(steps);
+    Serial.println(" steps");
+    stepper2.step(steps);
+    stepper2_position += steps;
+    Serial.println("Move 2 complete");
+  } else if (cmd.startsWith("MOVE3:")) {
+    int steps = cmd.substring(6).toInt();
+    Serial.print("Moving stepper 3 by ");
+    Serial.print(steps);
+    Serial.println(" steps");
+    stepper3.step(steps);
+    stepper3_position += steps;
+    Serial.println("Move 3 complete");
+  }*/ else if (cmd.startsWith("BL:")) {
+    // Brightness control command (future use)
+    int brightness = cmd.substring(3).toInt();
+    Serial.print("Brightness: ");
+    Serial.println(brightness);
   } else if (cmd == "TIME") {
+    // Send time on demand
     sendTimeToESP32();
-
   } else if (cmd.startsWith("SETTIME:")) {
+    // Expect format: SETTIME:YYYY-MM-DD HH:MM:SS
     int year, month, day, hour, minute, second;
-    if (sscanf(cmd.c_str(), "SETTIME:%d-%d-%d %d:%d:%d",
-               &year, &month, &day, &hour, &minute, &second) == 6) {
+    if (sscanf(cmd.c_str(), "SETTIME:%d-%d-%d %d:%d:%d", &year, &month, &day, &hour, &minute, &second) == 6) {
       if (!rtc_ok) {
-        Serial.println("TIME SET FAIL: no RTC");
-      } else if (year  >= 2000 && year  < 2100
-              && month >= 1    && month <= 12
-              && day   >= 1    && day   <= 31
-              && hour  >= 0    && hour  <  24
-              && minute >= 0   && minute < 60
-              && second >= 0   && second < 60) {
+        Serial.println("TIME SET FAIL (rtc missing)");
+      } else if (year >= 2000 && year < 2100 && month >= 1 && month <= 12 && day >= 1 && day <= 31 && hour >= 0 && hour < 24 && minute >= 0 && minute < 60 && second >= 0 && second < 60) {
         rtc.setYear(year - 2000);
         rtc.setMonth(month);
         rtc.setDate(day);
@@ -177,91 +187,57 @@ void handleCommand(const String &cmd) {
         rtc.setMinute(minute);
         rtc.setSecond(second);
         Serial.println("TIME SET OK");
-        sendTimeToESP32();
+        sendTimeToESP32();  // Echo updated time back to ESP32
       } else {
-        Serial.println("TIME SET FAIL: range error");
+        Serial.println("TIME SET FAIL (range)");
       }
     } else {
-      Serial.println("TIME SET FAIL: parse error");
+      Serial.println("TIME SET FAIL (parse)");
     }
-
   } else {
-    Serial.println("Unknown cmd: " + cmd);
+    Serial.print("Unknown command: ");
+    Serial.println(cmd);
   }
 }
 
-// ── Send time to ESP32 ─────────────────────────────────────────────────────
 void sendTimeToESP32() {
   if (!rtc_ok) {
+    Serial.println("RTC_NOT_FOUND");
     espSerial.println("RTC_NOT_FOUND");
     return;
   }
+  // Read time from RTC
+  bool h12 = false, PM_time = false;
+  uint8_t hour = rtc.getHour(h12, PM_time);
+  uint8_t minute = rtc.getMinute();
+  uint8_t second = rtc.getSecond();
 
-  // Check oscillator stop flag — RTC may have lost power
-  if (!rtc.oscillatorCheck()) {
-    Serial.println("RTC: oscillator stopped");
-    espSerial.println("RTC_OSC_STOP");
-    return;
-  }
-
-  // Check clock-halt bit
-  if (rtcClockHalted()) {
-    Serial.println("RTC: CH bit set");
-    clearRtcCH();
-    delay(20);
-  }
-
-  // Retry a few times in case of I2C noise
-  const int MAX_ATTEMPTS = 3;
-  uint8_t hour = 0, minute = 0, second = 0;
-  bool valid = false;
-  for (int i = 0; i < MAX_ATTEMPTS && !valid; i++) {
-    bool h12 = false, PM = false;
-    hour   = rtc.getHour(h12, PM);
-    minute = rtc.getMinute();
-    second = rtc.getSecond();
-    if (hour < 24 && minute < 60 && second < 60) valid = true;
-    else delay(10);
-  }
-
-  if (!valid) {
-    Serial.print("TIME_INVALID (");
-  Serial.print(hour);
-  Serial.print(",");
-  Serial.print(minute);
-  Serial.print(",");
-  Serial.print(second);
-  Serial.println(")");
+  // Validate the read; if the RTC is not wired/responding, DS3231 lib can return garbage (e.g., 0xFF -> 165)
+  if (hour >= 24 || minute >= 60 || second >= 60) {
+    Serial.println("TIME_INVALID");
     espSerial.println("TIME_INVALID");
     return;
   }
 
-  // Send TIME:HH:MM:SS
-  char buf[16];
-  snprintf(buf, sizeof(buf), "TIME:%02d:%02d:%02d", hour, minute, second);
-  espSerial.println(buf);
-  Serial.println("Sent: " + String(buf));
-}
-
-// ── RTC CH bit helpers ─────────────────────────────────────────────────────
-bool rtcClockHalted() {
-  Wire.beginTransmission(RTC_ADDR);
-  Wire.write(0x00);
-  if (Wire.endTransmission() != 0) return true;
-  Wire.requestFrom(RTC_ADDR, (uint8_t)1);
-  if (Wire.available() < 1) return true;
-  return (Wire.read() & 0x80);
-}
-
-bool clearRtcCH() {
-  Wire.beginTransmission(RTC_ADDR);
-  Wire.write(0x00);
-  if (Wire.endTransmission() != 0) return false;
-  Wire.requestFrom(RTC_ADDR, (uint8_t)1);
-  if (Wire.available() < 1) return false;
-  uint8_t raw = Wire.read() & 0x7F;
-  Wire.beginTransmission(RTC_ADDR);
-  Wire.write(0x00);
-  Wire.write(raw);
-  return (Wire.endTransmission() == 0);
+  // Send to ESP32 in format: "TIME:HH:MM:SS"
+  espSerial.print("TIME:");
+  if (hour < 10) espSerial.print("0");
+  espSerial.print(hour);
+  espSerial.print(":");
+  if (minute < 10) espSerial.print("0");
+  espSerial.print(minute);
+  espSerial.print(":");
+  if (second < 10) espSerial.print("0");
+  espSerial.println(second);
+  
+  // Also print to USB serial for debugging
+  Serial.print("Sent to ESP32: TIME:");
+  if (hour < 10) Serial.print("0");
+  Serial.print(hour);
+  Serial.print(":");
+  if (minute < 10) Serial.print("0");
+  Serial.print(minute);
+  Serial.print(":");
+  if (second < 10) Serial.print("0");
+  Serial.println(second);
 }
